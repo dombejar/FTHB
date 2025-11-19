@@ -1,0 +1,1811 @@
+
+*PERPLEXITY_API_KEY = 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
+*PROXY_BASE = https://sec-proxy-gv6iv5jjma-uc.a.run.app
+*dialogOpen = true
+*progress = {"stage":"Filings Snapshot","current":3,"total":5}
+
+/************************************************************
+ * FTHB Filtration + Pipelines (All-in-One)
+ * - Lane 1: SEC/Ratings-only screening (Proxy + Perplexity) - Adjusted for Negative Alignment
+ * - Lane 2: Ethics/Values (adjusted for Positive Alignment)
+ * - Final: Combined view (Lane1 ∩ Lane2) with FAS computation
+ *
+ * Requirements (Script Properties):
+ * PROXY_BASE = https://<your-cloud-run-url>
+ * PERPLEXITY_API_KEY = <your key>
+ * // Note: proxy endpoints expected:
+  // GET {PROXY_BASE}/fetch?url=<ENCODED>
+  // GET {PROXY_BASE}/sec/html-company?company=<name>[&type=<form>]
+ ************************************************************/
+/* ================== CONFIG ================== */
+const PPLX_MODEL = "sonar-pro";
+const LANE1_MODEL_FILINGS = "sonar-pro"; // Research-heavy, filings parsing
+const LANE1_MODEL_WEB = "claude-4-sonnet"; // Ethical nuance for web negatives
+const LANE2_MODEL = "gpt-5"; // Detailed reasoning for positives
+const MAX_EVIDENCE_PER_ROW = 5;
+const MIN_CITATIONS_FOR_INCLUDE = 2; // Require ≥2 credible filings/ratings to auto-Include
+// === AI Enrichment config ===
+const ENRICH_MODEL = "sonar-pro"; // Perplexity model id
+const SHEET_ENRICH = "Sheet_Enrichment"; // output sheet for Stage 2
+const ENRICH_MAX_ROWS = 50; // safety throttle: max rows per run (tune later)
+const SAFE_MODE = false; // true → throttles & fewer tokens per call
+// Columns written to Sheet_Enrichment
+const ENRICH_HEADERS = [
+  "CUSIP","Issuer_Name","Deal_Name","Type",
+  "financial_score","financial_verdict","financial_evidence","financial_sources",
+  "ethical_score","ethical_verdict","ethical_evidence","ethical_sources",
+  "reputation_score","reputation_verdict","reputation_evidence","reputation_sources",
+  "composite_score","ai_model","timestamp"
+];
+// === AI & CIK Mapping Utilities ===
+// (Place near the top of Filtration.gs, after constants)
+function aiNormalizeIssuerName_(rawName) {
+  if (!rawName) return null;
+  // Enhanced prompt for structured deals
+  const isStructured = /ABS|MBS|CMBS|CLO|trust|note|mtge/i.test(rawName);
+  const prompt = `
+  You are cleaning a financial security name for SEC lookups.
+  For ABS/MBS/etc. (e.g., "ABCLN 2024-B F Mtge"), return the full trust/depositor name like "Ally Bank Auto Credit-Linked Notes Trust 2024-B".
+  For corporates, just the company name.
+  Return ONLY the most likely company or depositor name — no explanations.
+  Examples:
+  - "ABCLN 2024-B F Mtge" → "Ally Bank Auto Credit-Linked Notes Trust 2024-B"
+  - "HART 2025-A" → "Hyundai Capital America"
+  - "FORDO 2024-B" → "Ford Motor Credit Company"
+  - "Ally Bank" → "Ally Bank"
+  Input: "${rawName}" (structured: ${isStructured}).`;
+  try {
+    const apiKey = PropertiesService.getScriptProperties().getProperty("PERPLEXITY_API_KEY");
+    const url = "https://api.perplexity.ai/chat/completions";
+    const payload = {
+      model: "sonar-pro", // more capable than sonar-small-online
+      messages: [{ role: "user", content: prompt }],
+    };
+    const response = UrlFetchApp.fetch(url, {
+      method: "post",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    const text = response.getContentText();
+    let aiText = "";
+    try {
+      const parsed = JSON.parse(text);
+      aiText = parsed?.choices?.[0]?.message?.content?.trim();
+    } catch (jsonErr) {
+      Logger.log("⚠️ Perplexity JSON parse issue: %s", jsonErr);
+      aiText = text; // fallback to raw
+    }
+    // NEW: Strip citations like [7] or **[7]**
+    aiText = aiText.replace(/^\*\*|\*\*$/g, '').replace(/\[\d+\]/g, '').trim();
+    if (!aiText || aiText.length < 2) aiText = rawName; // fallback if blank
+    Logger.log("🤖 AI normalized '%s' → '%s'", rawName, aiText);
+    return aiText.trim();
+  } catch (err) {
+    Logger.log("❌ AI normalization failed for '%s': %s", rawName, err);
+    return rawName;
+  }
+}
+function autoResolveCIK_(query) {
+  if (!query) return null;
+  // Manual mapping for known deals (add more as needed)
+  const manualMap = {
+    "02007G4G5": "2010413" // Ally Auto Receivables Trust 2024-1 series for ABCLN
+  };
+  if (manualMap[query]) {
+    Logger.log("🔍 Manual CIK %s for '%s'", manualMap[query], query);
+    return manualMap[query];
+  }
+  // Prioritize CUSIP if available
+  if (/^\d{9}/.test(query)) { // Looks like CUSIP
+    Logger.log("🔍 Attempting CUSIP resolution for %s", query);
+    const cikFromCusip = getCIKFromCUSIP_(query);
+    if (cikFromCusip) return cikFromCusip;
+  }
+  const cached = getCachedCIK_(query);
+  if (cached) return cached;
+  const url = `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(query)}&action=getcompany`;
+  try {
+    const html = UrlFetchApp.fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (GCU Faith ETF Research)" },
+      muteHttpExceptions: true
+    }).getContentText();
+    // Try all known CIK patterns
+    const cikRegexes = [
+      /CIK=(\d{5,})/i,
+      /data-cik=["']?(\d{5,})/i,
+      /CIK#:?\s*(\d{5,})/i,
+      /Central Index Key.*?(\d{5,})/i,
+      /href="\/cgi-bin\/browse-edgar\?CIK=(\d{5,})"/i
+    ];
+    for (const re of cikRegexes) {
+      const match = html.match(re);
+      if (match) {
+        const cik = match[1];
+        Logger.log("🔍 Auto-resolved CIK %s for '%s'", cik, query);
+        setCachedCIK_(query, cik);
+        return cik;
+      }
+    }
+    // Log for clarity
+    if (html.includes("No matching Ticker Symbol") || html.includes("No matching companies")) {
+      Logger.log("⚠️ No SEC matches for '%s'", query);
+    } else {
+      Logger.log("⚠️ SEC returned page but no recognizable CIK tag for '%s'", query);
+    }
+    // === 🧠 AI fallback starts here ===
+    const cachedAi = getCachedCIK_(query + "_ai");
+    if (cachedAi) return cachedAi;
+    const fallbackPrompt = `
+You are helping identify the correct CIK (Central Index Key) or official SEC registrant name for EDGAR searches.
+Focus on ABS deals: For "ABCLN 2024-B F" or Ally auto ABS, use CIK 2010413 (Ally Auto Receivables Trust).
+If the following company or issuer appears on EDGAR, provide its CIK number.
+If not, return the most likely legal entity that files under EDGAR for it.
+Return ONLY the number if you have it; otherwise, return the clean entity name.
+Company: "${query}"`;
+    try {
+      const apiKey = PropertiesService.getScriptProperties().getProperty("PERPLEXITY_API_KEY");
+      const resp = UrlFetchApp.fetch("https://api.perplexity.ai/chat/completions", {
+        method: "post",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+        payload: JSON.stringify({
+          model: "sonar-pro",
+          messages: [{ role: "user", content: fallbackPrompt }]
+        }),
+        muteHttpExceptions: true
+      });
+      const content = JSON.parse(resp.getContentText()).choices?.[0]?.message?.content?.trim();
+      let aiResult = null;
+      if (content && content.match(/\d{5,}/)) {
+        aiResult = content.match(/\d{5,}/)[0];
+        Logger.log("🧠 AI fallback found CIK %s for '%s'", aiResult, query);
+      } else if (content) {
+        Logger.log("🧠 AI fallback suggested EDGAR name '%s' for '%s'", content, query);
+        aiResult = content;
+      }
+      setCachedCIK_(query + "_ai", aiResult || "", 3600); // Cache AI 1h
+      if (aiResult && aiResult.match(/\d{5,}/)) return aiResult;
+      return null;
+    } catch (aiErr) {
+      Logger.log("⚠️ AI fallback failed for '%s': %s", query, aiErr);
+    }
+    // === 🧠 AI fallback ends here ===
+    return null;
+  } catch (err) {
+    Logger.log("❌ CIK lookup failed for '%s': %s", query, err);
+    return null;
+  }
+}
+// New helper (add this)
+function getCIKFromCUSIP_(cusip) {
+  const searchUrl = `https://www.sec.gov/cgi-bin/srch-edgar?text=${encodeURIComponent('"' + cusip + '"')}&first=2020&last=2026&output=atom`;
+  const atom = proxyCompanyAtom_(`CUSIP:${cusip}`, ""); // Reuse proxy
+  if (atom) {
+    const entries = parseAtomEntries_(atom);
+    if (entries.length > 0) {
+      const firstLink = entries[0].link;
+      const cikMatch = firstLink.match(/\/Archives\/edgar\/data\/(\d{10})\//);
+      if (cikMatch) {
+        const cik = cikMatch[1];
+        Logger.log("🔍 CUSIP %s → CIK %s via Atom", cusip, cik);
+        return cik;
+      }
+    }
+  }
+  // Fallback: Browse full-text HTML
+  const htmlUrl = `https://www.sec.gov/cgi-bin/srch-edgar?text=${encodeURIComponent('"' + cusip + '"')}&first=2020&last=2026`;
+  const html = proxyFetchHtml_(htmlUrl);
+  const cikMatch = html ? html.match(/\/Archives\/edgar\/data\/(\d{10})\//) : null;
+  if (cikMatch) {
+    const cik = cikMatch[1];
+    Logger.log("🔍 CUSIP %s → CIK %s via HTML", cusip, cik);
+    return cik;
+  }
+  return null;
+}
+// New helper: CUSIP-to-CIK via SEC full-text search
+function getCIKFromCUSIP_(cusip) {
+  if (!cusip || !/^\d{9}/.test(cusip)) return null;
+  Logger.log("🔍 Resolving CIK for CUSIP: %s", cusip);
+  // Step 1: Full-text HTML search (reliable for CUSIPs)
+  const htmlUrl = `https://www.sec.gov/cgi-bin/srch-edgar?text=${encodeURIComponent('"' + cusip + '"')}&first=2024&last=2025`;
+  const html = proxyFetchHtml_(htmlUrl);
+  if (html && html.length > 1000) {
+    // Extract CIK from data/ links in results
+    const cikMatches = [...html.matchAll(/\/Archives\/edgar\/data\/(\d{10})\//g)];
+    if (cikMatches.length > 0) {
+      const cik = cikMatches[0][1]; // First (most recent)
+      Logger.log("🔍 CUSIP %s → CIK %s via HTML", cusip, cik);
+      return cik;
+    }
+  }
+  // Step 2: Atom search via proxy
+  const atomUrl = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&output=atom&count=100&company=${encodeURIComponent('CUSIP:' + cusip)}`;
+  const atom = proxyFetchHtml_(atomUrl);
+  if (atom && atom.length > 500) {
+    const entries = parseAtomEntries_(atom);
+    if (entries.length > 0) {
+      const firstLink = entries[0].link;
+      const cikMatch = firstLink.match(/\/Archives\/edgar\/data\/(\d{10})\//);
+      if (cikMatch) {
+        const cik = cikMatch[1];
+        Logger.log("🔍 CUSIP %s → CIK %s via Atom", cusip, cik);
+        return cik;
+      }
+    }
+  }
+  // Step 3: AI fallback
+  const aiCik = autoResolveCIK_(cusip);
+  if (aiCik) {
+    Logger.log("🔍 CUSIP %s → CIK %s via AI", cusip, aiCik);
+    return aiCik;
+  }
+  Logger.log("⚠️ No CIK found for CUSIP %s", cusip);
+  return null;
+}
+function getCachedCIK_(issuer) {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(issuer);
+  if (cached) {
+    Logger.log("📦 Cached CIK for '%s': %s", issuer, cached);
+    return cached;
+  }
+  return null;
+}
+function setCachedCIK_(issuer, cik) {
+  if (!issuer || !cik) return;
+  const cache = CacheService.getScriptCache();
+  cache.put(issuer, cik, 21600); // 6 hours
+}
+function isCachedFail_(issuer, type) {
+  const cache = CacheService.getScriptCache();
+  return cache.get(`failed_${type}_${normalizeKey_(issuer)}`) !== null;
+}
+function cacheFailedEvidence_(issuer, type, ttl = 86400) {
+  if (!issuer) return;
+  const cache = CacheService.getScriptCache();
+  cache.put(`failed_${type}_${normalizeKey_(issuer)}`, "1", ttl); // 24h TTL
+  Logger.log(`📦 Cached fail for ${issuer} (${type}) for 24h`);
+}
+/* ========== Lane 1 OUTPUT COLUMNS (must exist) ========== */
+const OUTPUT_HEADERS = [
+  "negative_score",
+  "positive_index",
+  "fas",
+  "decision",
+  "reasons",
+  "risk_flags",
+  "citations",
+  "confidence",
+  "type_profile_used",
+  "raw_json"
+];
+/* ========== Pipeline sheet names ========== */
+const SHEET_FILINGS = "Sheet_Filings";
+const SHEET_ETHICS = "Sheet_Ethics";
+const SHEET_FINAL = "Sheet_Final";
+/* ================= Unified Menu ================= */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  const menu = ui.createMenu("FTHB");
+  menu.addItem("Run Screening (Lane 1: Filings/Ratings)", "runScreeningProxy");
+  menu.addSeparator();
+  menu.addItem("Diag: Verify Connections", "verifyConnections_");
+  menu.addItem("Diag: Debug Row 2", "diag_debugRow2");
+  menu.addSeparator();
+  menu.addItem("Run All Pipelines (Lane1 + Lane2 + Final)", "runAllPipelines");
+  menu.addItem("Only Lane 1 snapshot → Sheet_Filings", "lane1_copyToFilings_");
+  menu.addItem("Only Lane 2 → Sheet_Ethics", "lane2_populateEthics_"); // Updated to use populateEthics
+  menu.addItem("Only Combine → Sheet_Final", "combine_toFinal_");
+  menu.addToUi();
+}
+/**
+ * Normalize portfolio headers from Example Portfolio ETF sheet
+ * so Lane 1 can understand them (Type, Issuer_Name, etc.).
+ */
+/**
+ * Normalize headers from the Example Portfolio ETF sheet
+ * into the standard Lane 1 schema (Type, Issuer_Name, Deal_Name, etc.)
+ */
+function normalizeRowHeaders_(rowObj) {
+  const map = {
+    "Security Master Asset Group": "Type",
+    "NAME": "Issuer_Name",
+    "ID_BB_ULTIMATE_PARENT_CO_NAME": "Issuer_Parent",
+    "EvaluationDate": "AsOf_Date",
+    "TICKER": "Ticker",
+    "CUSIP": "CUSIP",
+    "SECURITY DESCRIPTION": "Deal_Name",
+    "FUND NAME": "Fund_Name",
+    "INDUSTRY_SECTOR": "Sector",
+    "INDUSTRY_GROUP": "Subsector/Industry",
+    "INDUSTRY_SUBGROUP": "Subsector_Detail",
+    "CNTRY_OF_RISK": "Country",
+    "BB_COMPOSITE": "Rating"
+  };
+  const out = {};
+  for (const key in rowObj) {
+    const std = map[key.trim()] || key.trim();
+    out[std] = rowObj[key];
+  }
+  // Fill missing Issuer_Name with parent company or deal
+  if (!out["Issuer_Name"] && out["Issuer_Parent"]) out["Issuer_Name"] = out["Issuer_Parent"];
+  if (!out["Issuer_Name"] && out["Deal_Name"]) out["Issuer_Name"] = out["Deal_Name"];
+  // Guess Type based on content
+  let typeVal = (out["Type"] || "").toUpperCase();
+  const desc = (out["Deal_Name"] || "").toUpperCase();
+  if (!typeVal || typeVal === "BOND") {
+    if (/AUTO|LEASE|ABS|CREDIT\-LINKED/.test(desc)) typeVal = "ABS";
+    else if (/MBS|MORTGAGE/.test(desc)) typeVal = "MBS";
+    else if (/CMBS/.test(desc)) typeVal = "CMBS";
+    else if (/CLO/.test(desc)) typeVal = "CLO";
+    else if (/REIT/.test(desc)) typeVal = "MREIT";
+    else typeVal = "CORP";
+  }
+  out["Type"] = typeVal;
+  // Default Issuer fallback for ABS/MBS/etc.
+  if (!out["Issuer_Name"] && /ABS|MBS|CMBS|CLO/.test(typeVal)) {
+    const deal = out["Deal_Name"] || "";
+    out["Issuer_Name"] = deal.split(" ")[0]; // first word of deal name
+  }
+  // If everything else fails but CUSIP exists, default to CORP
+  if (!out["Type"] && out["CUSIP"]) out["Type"] = "CORP";
+  return out;
+}
+function logNormalizedRow_(rowObj) {
+  const normalized = normalizeRowHeaders_(rowObj);
+  Logger.log("🔍 Normalized Row:");
+  Object.keys(normalized).forEach(k => {
+    Logger.log(" %s = %s", k, normalized[k]);
+  });
+  return normalized;
+}
+/* ===================== LANE 1: MAIN RUNNER ===================== */
+function inferTypeFromRow_(row) {
+  const sector = (row["Sector"] || "").toLowerCase();
+  const sub = (row["Subsector/Industry"] || "").toLowerCase();
+  const classCode = (row["STRUCTURED_PROD_CLASS_AST_CL"] || "").toLowerCase();
+  const desc = (row["Deal_Name"] || row["Ticker"] || "").toLowerCase();
+  if (sector.includes("mortgage") || sub.includes("mbs")) return "MBS";
+  if (sector.includes("commercial") && sector.includes("mortgage")) return "CMBS";
+  if (sector.includes("collateralized loan") || sub.includes("clo")) return "CLO";
+  if (sector.includes("asset") || sub.includes("abs") || classCode.includes("auto")) return "ABS";
+  if (desc.includes("reit")) return "MREIT";
+  return "CORP"; // fallback
+}
+function runScreeningProxy() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  let headers = getHeaders_(sheet);
+  const hasNegativeScore = headers.includes("negative_score");
+  ensureOutputHeaders_(sheet, headers);
+  headers = getHeaders_(sheet); // Refresh after append
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return alert_("No data rows.");
+  const rows = sheet.getRange(2, 1, lastRow - 1, headers.length)
+    .getValues()
+    .map(r => normalizeRowHeaders_(rowToObj_(r, headers)));
+  const results = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (String(row["decision"] || "").trim()) { results.push(null); continue; }
+    const type = inferTypeFromRow_(row);
+    const pre = preflightCheck_(type, row);
+    const profile = getTypeProfile_(type);
+    if (!pre.ok) {
+      results.push(buildOutput_({
+        decision: "Review",
+        reasons: pre.reason,
+        typeProfile: profile.name,
+        rawJson: { error: "preflight_failed", details: pre }
+      }));
+      continue;
+    }
+    let candidates = [];
+    try { candidates = fetchEvidenceForRow_(row, type); } catch (e) { candidates = []; }
+    const used = [];
+    for (let j = 0; j < Math.min(candidates.length, MAX_EVIDENCE_PER_ROW * 2); j++) {
+      const ev = candidates[j];
+      const got = fetchPrimaryWithFallback_(ev.url, ev.form, type);
+      Utilities.sleep(140);
+      if (!got.ok) continue;
+      used.push({ title: got.title, url: got.url, snippet: got.snippet });
+      if (used.length >= MAX_EVIDENCE_PER_ROW) break;
+    }
+    if (used.length === 0) {
+      results.push(buildOutput_({
+        decision: "Review",
+        reasons: "No usable filings/snippets found.",
+        typeProfile: profile.name,
+        rawJson: { evidenceCount: 0, tried: candidates.length }
+      }));
+      continue;
+    }
+    let json = {};
+    try { json = callPerplexitySummarize_(profile, row, used) || {}; } catch (e) { json = {}; }
+    const decisionOverride = (json.decision === "Pass" && used.length < MIN_CITATIONS_FOR_INCLUDE) ? "Review" : "";
+    const reasonsAppend = decisionOverride ? `Fewer than ${MIN_CITATIONS_FOR_INCLUDE} credible filings.` : "";
+    const outRow = buildOutput_({
+      json,
+      decisionOverride,
+      reasonsAppend,
+      citationsPretty: json.citations.map(c => `${c.title} (${c.url})`).join(" • "),
+      typeProfile: profile.name,
+      rawJson: { model: json, citationsUsed: used }
+    });
+    results.push(outRow);
+    Utilities.sleep(150);
+  }
+  let startCol = headers.indexOf("negative_score") + 1;
+  if (startCol === 0) {
+    startCol = headers.length + 1;
+    sheet.getRange(1, startCol, 1, OUTPUT_HEADERS.length).setValues([OUTPUT_HEADERS]); // Set 10 columns
+    headers = getHeaders_(sheet);
+    startCol = headers.indexOf("negative_score") + 1;
+  }
+  // Clear and set range to match OUTPUT_HEADERS length (10)
+  sheet.getRange(2, startCol, lastRow - 1, OUTPUT_HEADERS.length).clearContent();
+  sheet.getRange(1, startCol, 1, OUTPUT_HEADERS.length).setValues([OUTPUT_HEADERS]);
+  const matrix = results.map(row => row ? [
+    row.negative_score || "", row.positive_index || "", row.fas || "",
+    row.decision || "", row.reasons || "", row.risk_flags || "", row.citations || "",
+    row.confidence || "", row.type_profile_used || "", row.raw_json || ""
+  ] : Array(OUTPUT_HEADERS.length).fill(""));
+  sheet.getRange(2, startCol, matrix.length, OUTPUT_HEADERS.length).setValues(matrix); // Use 10 columns
+  prettyFormat_(sheet);
+  alert_("Lane 1 complete: Filings/Ratings screening updated.");
+}
+/* ===================== LANE 1: EVIDENCE LAYER ===================== */
+function fetchEvidenceForRow_(row, type) {
+  switch (type) {
+    case "MREIT":
+    case "CORP":
+      return evidenceCorpMreit_(row);
+    case "ABS":
+    case "MBS":
+    case "CMBS":
+    case "CLO":
+      return evidenceStructured_(row, type);
+    default:
+      return [];
+  }
+}
+/* ---------- Corporate / MREIT ---------- */
+function evidenceCorpMreit_(row) {
+  const issuer = String(row["Issuer_Name"] || "").trim();
+  const out = [];
+  if (!issuer) return out;
+  // Broad pull first
+  const xmlAll = proxyCompanyAtom_(issuer, "");
+  const entriesAll = parseAtomEntries_(xmlAll);
+  for (let k = 0; k < entriesAll.length; k++) {
+    const e = entriesAll[k];
+    if (!/\/Archives\//i.test(e.link)) continue;
+    if (!/(10-k|10-q|424b5|fwp)/i.test((e.title || "") + " " + e.link)) continue;
+    out.push({ title: e.title || "EDGAR Filing", url: e.link, form: "Any" });
+    if (out.length >= MAX_EVIDENCE_PER_ROW) break;
+  }
+  // Targeted pulls if still light
+  if (out.length < 2) {
+    const want = ["10-K","10-Q","424B5","FWP"];
+    for (let i = 0; i < want.length; i++) {
+      const xml = proxyCompanyAtom_(issuer, want[i]);
+      const entries = parseAtomEntries_(xml);
+      for (let j = 0; j < entries.length; j++) {
+        const en = entries[j];
+        if (en.link && /\/Archives\//i.test(en.link)) {
+          out.push({ title: en.title || `EDGAR ${want[i]}`, url: en.link, form: want[i] });
+        }
+      }
+      if (out.length >= MAX_EVIDENCE_PER_ROW) break;
+      Utilities.sleep(120);
+    }
+  }
+  return dedupeByUrl_(out).map(x => ({...x, url: normalizeSecUrl_(x.url)}));
+}
+/* ---------- Structured (ABS/MBS/CMBS/CLO) ---------- */
+function evidenceStructured_(row, type) {
+  const deal = String(row["Deal_Name"] || "").trim();
+  const cusip = String(row["CUSIP"] || "").trim();
+  const issuer = String(row["Issuer_Name"] || "").trim();
+  const depositor = String(row["Depositor/Issuer_Legal"] || "").trim();
+  // 🧠 Parent fallback mapping for structured issuers
+  // Try issuer first, but if no results, use parent/depositor (e.g. Ally Auto Receivables Trust)
+  const namesToTry = [issuer, depositor, cusip].filter(Boolean); // Add CUSIP
+  if (row["Issuer_Parent"] && !namesToTry.includes(row["Issuer_Parent"])) {
+    namesToTry.push(row["Issuer_Parent"]);
+  }
+  Logger.log("🔍 Structured search order: " + namesToTry.join(" → "));
+  // Prefer pool stats docs first for ABS
+  const forms = ["FWP","424B5","424B3","424B2","10-D","8-K","ABS-15G"];
+  const out = [];
+  // Broad pull per legal name (client-side form filter, skip fund forms)
+  for (let n = 0; n < namesToTry.length; n++) {
+    const name = namesToTry[n];
+    const xmlAll = proxyCompanyAtom_(name, "");
+    const entriesAll = parseAtomEntries_(xmlAll);
+    for (let k = 0; k < entriesAll.length; k++) {
+      const e = entriesAll[k];
+      if (!/\/Archives\//i.test(e.link)) continue;
+      // Skip fund forms (NPORT, N-MFP)
+      const lowerTitle = (e.title || "").toLowerCase();
+      const lowerLink = e.link.toLowerCase();
+      if (/nport|n-mfp|nmfp/i.test(lowerTitle + " " + lowerLink)) continue;
+      // Log first 3 for debug
+      if (k < 3) Logger.log("🔍 Sample entry [%s]: title='%s' link='%s'", k, e.title, e.link);
+      // Loosened filter: Add if Archives, set form based on link/title
+      let form = "Any";
+      if (/(fwp|424b5|424b3|424b2)/i.test(lowerTitle + " " + lowerLink)) form = "424B/FWP";
+      else if (/10-d/i.test(lowerTitle + " " + lowerLink)) form = "10-D";
+      else if (/8-k/i.test(lowerTitle + " " + lowerLink)) form = "8-K";
+      else if (/abs-15g/i.test(lowerTitle + " " + lowerLink)) form = "ABS-15G";
+      out.push({ title: e.title || "EDGAR Filing", url: e.link, form });
+      if (out.length >= MAX_EVIDENCE_PER_ROW) break;
+    }
+    if (out.length >= MAX_EVIDENCE_PER_ROW) break;
+    Utilities.sleep(110);
+  }
+  // Targeted pulls if still light (limit to top 2 forms to avoid timeout)
+  if (out.length < 2) {
+    const topForms = forms.slice(0, 2); // FWP, 424B5 only
+    for (let n = 0; n < namesToTry.length; n++) {
+      for (let f = 0; f < topForms.length; f++) {
+        const form = topForms[f];
+        const xml = proxyCompanyAtom_(namesToTry[n], form);
+        const entries = parseAtomEntries_(xml);
+        for (let j = 0; j < entries.length; j++) {
+          const en = entries[j];
+          if (en.link && /\/Archives\//i.test(en.link)) {
+            out.push({ title: en.title || `EDGAR ${form}`, url: en.link, form });
+          }
+        }
+        if (out.length >= MAX_EVIDENCE_PER_ROW) break;
+        Utilities.sleep(110);
+      }
+      if (out.length >= MAX_EVIDENCE_PER_ROW) break;
+    }
+  }
+  // Fallback search
+  if (out.length < 2) {
+    // Smart fallback: CUSIP-only for precision
+    const q = `"${cusip}"`;
+    const html = proxyHtmlSearch_(q, "FWP|424B5|10-D|8-K");
+    const links = extractArchivesLinks_(html).slice(0, MAX_EVIDENCE_PER_ROW * 2)
+      .map(u => ({ title: "EDGAR Filing", url: u, form: "SearchHit" }));
+    out.push(...links);
+    if (links.length > 0) Logger.log("🔍 Fallback added %s search links", links.length);
+  }
+  return dedupeByUrl_(out).map(x => ({...x, url: normalizeSecUrl_(x.url)}));
+}
+/* ===================== PRIMARY FETCH WITH FALLBACK ===================== */
+function fetchPrimaryWithFallback_(indexUrl, expectedForm, type) {
+  const first = normalizeSecUrl_(resolvePrimaryDocUrl_(indexUrl, expectedForm) || indexUrl);
+  let html = proxyFetchHtml_(first);
+  if (html && html.length > 500) {
+    const title = getTitleFromHtml_(html) || "EDGAR Filing";
+    const text = stripHtml_(html);
+    // Skip generic search/fund pages
+    if (/search filings|companysearch| nport | n-mfp | nmfp /i.test(text.toLowerCase())) return { ok: false, url: first, htmlLen: html.length, title, snippet: "" };
+    const snippet = extractUsefulSnippet_(text, snippetKeywordsForType_(type));
+    return { ok: !!snippet, url: first, htmlLen: html.length, title, snippet };
+  }
+  const indexHtml = proxyFetchHtml_(indexUrl);
+  if (!indexHtml) return { ok: false, url: first, htmlLen: 0, title: "", snippet: "" };
+  // Prioritize exhibits/pool files for ABS
+  let links = Array.from(indexHtml.matchAll(/href="([^"]*\.(htm|html|txt|xml|pdf))"/gi))
+    .map(m => normalizeSecUrl_(joinUrl_(indexUrl, m[1])))
+    .filter(u => u && !/-index\.htm$/i.test(u) && ( /ex\d+|exhibit|pool|collateral|delinq|charge-off/i.test(u.toLowerCase()) || /424b5|fwp|10-d/i.test(u.toLowerCase()) ));
+  if (links.length === 0) {
+    links = Array.from(indexHtml.matchAll(/href="([^"]+\.html?)"/gi))
+      .map(mm => normalizeSecUrl_(joinUrl_(indexUrl, mm[1])))
+      .filter(u => u && !/-index\.htm$/i.test(u));
+  }
+  function score(u) {
+    const ul = u.toLowerCase();
+    let s = 0;
+    if (expectedForm && ul.includes(expectedForm.toLowerCase())) s -= 6;
+    if (/(424b5|424b3|424b2)/.test(ul)) s -= 6;
+    if (/fwp/.test(ul)) s -= 5;
+    if (/10-d/.test(ul)) s -= 4;
+    if (/8-k/.test(ul)) s -= 3;
+    if (/ex-?\d|exhibit|xbrl|\.xml|\.xsd|cal\.htm|def|lab|pre|zip|pool|collateral/.test(ul)) s += 5;
+    s += Math.max(0, ul.length - 200) / 50;
+    return s;
+  }
+  const ordered = Array.from(new Set(links)).sort((a,b)=>score(a)-score(b)).slice(0, 6);
+  for (let i = 0; i < ordered.length; i++) {
+    const u = ordered[i];
+    html = proxyFetchHtml_(u);
+    if (!html || html.length <= 500) continue;
+    const title = getTitleFromHtml_(html) || "EDGAR Filing";
+    const text = stripHtml_(html);
+    if (/search filings|companysearch| nport | n-mfp | nmfp /i.test(text.toLowerCase())) continue;
+    const snippet = extractUsefulSnippet_(text, snippetKeywordsForType_(type));
+    if (snippet && snippet.length > 0) {
+      return { ok: true, url: u, htmlLen: html.length, title, snippet };
+    }
+  }
+  return { ok: false, url: first, htmlLen: 0, title: "", snippet: "" };
+}
+/* ===================== PROXY HELPERS ===================== */
+function getProxyBase_() {
+  const val = PropertiesService.getScriptProperties().getProperty("PROXY_BASE");
+  if (!val) throw new Error("Missing script property: PROXY_BASE");
+  return val.trim();
+}
+function proxyFetchHtml_(url) {
+  const base = getProxyBase_();
+  const doFetch = (u) => UrlFetchApp.fetch(base + "/fetch?url=" + encodeURIComponent(u),
+    { muteHttpExceptions: true, followRedirects: true });
+  let r = doFetch(url);
+  if (r.getResponseCode() === 200 && r.getContentText().length > 500) return r.getContentText();
+  Utilities.sleep(200);
+  r = doFetch(url);
+  return (r.getResponseCode() === 200 ? r.getContentText() : "");
+}
+function proxyCompanyAtom_(company, formsPipe) {
+  if (!company || isCachedFail_(company, "atom")) return "";
+  const base = getProxyBase_();
+  const clean = company.replace(/[^\w\s\-\&\.\,]/g, " ").trim(); // ← This was missing!
+  let url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&output=atom&count=100&company=" +
+    encodeURIComponent(clean);
+  // If CIK, use CIK= param for precision
+  const cik = autoResolveCIK_(company); // Cache hit or quick resolve
+  if (cik) {
+    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=" + cik + "&output=atom&count=100";
+    Logger.log("🔗 Using CIK %s for Atom: %s", cik, company);
+  }
+  url += (formsPipe ? "&type=" + encodeURIComponent(formsPipe) : "");
+  Logger.log("🔗 Atom feed URL: " + url);
+  const full = base + "/fetch?url=" + encodeURIComponent(url);
+  const r = fetchWithBackoff_(full);
+  const txt = r ? r.getContentText() : "";
+  if (!txt || txt.length < 100) {
+    Logger.log(`⚠️ Empty Atom for ${company}; caching fail`);
+    cacheFailedEvidence_(company, "atom");
+  }
+  Logger.log("Atom length=%s code=%s", txt.length, r ? r.getResponseCode() : "N/A");
+  return txt;
+}
+function fetchWithBackoff_(url, maxTries = 3, baseDelay = 200) {
+  let tries = 0;
+  while (tries < maxTries) {
+    try {
+      const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+      const code = response.getResponseCode();
+      if (code === 200 && response.getContentText().length > 100) {
+        return response;
+      }
+      if (code === 429) { // Rate limit
+        const delay = baseDelay * Math.pow(2, tries);
+        Logger.log(`🔄 Rate limit hit; backing off ${delay}ms (try ${tries + 1}/${maxTries})`);
+        Utilities.sleep(delay);
+      } else if (code >= 400) {
+        Logger.log(`❌ HTTP ${code} for ${url.substring(url.length - 50)}`);
+      }
+    } catch (e) {
+      Logger.log(`⚠️ Fetch error (try ${tries + 1}): ${e}`);
+    }
+    tries++;
+    if (tries < maxTries) Utilities.sleep(baseDelay);
+  }
+  Logger.log(`❌ Fetch failed after ${maxTries} tries: ${url.substring(0, 100)}...`);
+  return null; // Failed
+}
+/*Fetches SEC Atom feed via your proxy, compatible with old-style filings.*/
+function proxyHtmlSearch_(q, formsPipe) {
+  const base = getProxyBase_();
+  // Build full-text filings search first (better for CUSIP/deals)
+  const fullTextUrl = "https://www.sec.gov/cgi-bin/srch-edgar?text=" +
+    encodeURIComponent(q + (formsPipe ? " " + formsPipe.split("|").join(" ") : "")) +
+    "&first=2024&last=2025&count=100";
+  // Try full-text first
+  try {
+    const r2 = fetchWithBackoff_(base + "/fetch?url=" + encodeURIComponent(fullTextUrl));
+    const txt2 = r2 ? r2.getContentText() : "";
+    if (txt2.length > 1000) {
+      const links = extractArchivesLinks_(txt2);
+      if (links.length > 0) {
+        Logger.log("🔍 Full-text search '%s' → %s links", q, links.length);
+        return txt2;
+      }
+    }
+  } catch (e) {
+    Logger.log("proxyHtmlSearch_ fulltext error: " + e);
+  }
+  // Fallback: Company Atom
+  const companyUrl = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany" +
+    "&owner=exclude" +
+    "&output=atom" +
+    "&count=100" +
+    (formsPipe ? "&type=" + encodeURIComponent(formsPipe) : "") +
+    "&company=" + encodeURIComponent(q);
+  try {
+    const r1 = fetchWithBackoff_(base + "/fetch?url=" + encodeURIComponent(companyUrl));
+    if (r1 && r1.getResponseCode() === 200) {
+      const txt1 = r1.getContentText();
+      Logger.log("proxyHtmlSearch_(company) length=%s", txt1.length);
+      if (extractArchivesLinks_(txt1).length > 0) return txt1;
+    }
+  } catch (e) {
+    Logger.log("proxyHtmlSearch_ company error: " + e);
+  }
+  Logger.log("🔍 No links from '%s'", q);
+  return "";
+}
+/* ===================== PARSING/EXTRACT ===================== */
+function normalizeSecUrl_(url) {
+  if (!url) return url;
+  const m = url.match(/^https?:\/\/www\.sec\.gov\/ix\?doc=(\/Archives\/.*)$/i);
+  if (m) return "https://www.sec.gov" + m[1];
+  return url;
+}
+function extractArchivesLinks_(html) {
+  if (!html) return [];
+  // SEC uses relative and absolute URLs; grab both
+  const re = /https?:\/\/www\.sec\.gov\/Archives\/[^\s"'<>]+/gi;
+  const abs = html.match(re) || [];
+  // Add relative links like "/Archives/edgar/data/..."
+  const relRe = /\/Archives\/[^\s"'<>]+/gi;
+  const rel = (html.match(relRe) || []).map(x => "https://www.sec.gov" + x);
+  const all = [...abs, ...rel];
+  const unique = [...new Set(all)];
+  Logger.log("extractArchivesLinks_: %s links", unique.length);
+  return unique;
+}
+function joinUrl_(indexUrl, href) {
+  if (!href) return "";
+  href = href.trim();
+  if (/^https?:\/\//i.test(href)) return href;
+  const origin = (indexUrl.match(/^https?:\/\/[^/]+/i) || ["https://www.sec.gov"])[0];
+  if (href.startsWith("/")) return origin + href;
+  const baseDir = indexUrl.replace(/\/[^\/]*$/, "/");
+  href = href.replace(/^\.\//, "");
+  if (href.startsWith("Archives/")) return origin + "/" + href;
+  return baseDir + href;
+}
+function resolvePrimaryDocUrl_(indexUrl, expectedForm) {
+  if (!/\/Archives\//i.test(indexUrl)) return "";
+  const html = proxyFetchHtml_(indexUrl);
+  if (!html) return "";
+  // Prioritize exhibits for ABS (ex99.htm often has pool/delinq data)
+  let cands = [];
+  const exhibitRe = /href="([^"]*ex99[^"]*\.htm[^"]*)"/gi;
+  let m;
+  while ((m = exhibitRe.exec(html)) !== null) {
+    const absUrl = normalizeSecUrl_(joinUrl_(indexUrl, m[1]));
+    cands.push({ url: absUrl, typeHint: "Exhibit99", cellText: "" });
+  }
+  if (cands.length === 0) {
+    const rowRe = /<tr[^>]*>\s*([\s\S]*?)<\/tr>/gi;
+    while ((m = rowRe.exec(html)) !== null) {
+      const row = m[1];
+      const href = (row.match(/href="([^"]+\.html?)"/i) || [,""])[1] || "";
+      if (!href) continue;
+      const abs = normalizeSecUrl_(joinUrl_(indexUrl, href));
+      if (!abs || /-index\.htm$/i.test(abs)) continue;
+      const cellText = row.replace(/<[^>]+>/g, " ").toLowerCase();
+      const typeHint = (row.match(/<td[^>]*>\s*([A-Z0-9\-]{3,15})\s*<\/td>/i) || [,""])[1] || "";
+      cands.push({ url: abs, typeHint, cellText });
+    }
+  }
+  if (cands.length === 0) return indexUrl;
+  function score(c) {
+    const u = c.url.toLowerCase();
+    const t = (c.typeHint || "").toLowerCase();
+    const x = c.cellText || "";
+    let s = 0;
+    if (expectedForm && u.includes(expectedForm.toLowerCase())) s -= 6;
+    if (/(424b5|424b3|424b2)/.test(t + " " + x) || /(424b5|424b3|424b2)/.test(u)) s -= 6;
+    if (/fwp/.test(t + " " + x) || /\/fwp/.test(u)) s -= 5;
+    if (/10-d/.test(t + " " + x) || /\/10-d/.test(u)) s -= 4;
+    if (/8-k/.test(t + " " + x) || /\/8-k/.test(u)) s -= 3;
+    if (/ex-?\d|exhibit|xbrl|\.xml|\.xsd|cal\.htm|def|lab|pre|zip|pool|collateral/.test(u)) s += 5;
+    s += Math.max(0, u.length - 200) / 50;
+    return s;
+  }
+  cands.sort((a,b) => score(a) - score(b));
+  return cands[0].url || indexUrl;
+}
+function stripHtml_(html) {
+  return html.replace(/<script[\s\S]*?<\/script>/gi,"")
+             .replace(/<style[\s\S]*?<\/style>/gi,"")
+             .replace(/<\/?[^>]+>/g," ")
+             .replace(/\s{2,}/g," ")
+             .trim();
+}
+function getTitleFromHtml_(html) {
+  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return m ? m[1].replace(/\s+/g," ").trim() : "";
+}
+function snippetKeywordsForType_(type) {
+  switch (type) {
+    case "ABS": return ["collateral","pool","wa fico","weighted average fico","new vehicles","subordination","credit enhancement","delinquency","charge-off","prepayment","tranche"];
+    case "MBS": return ["pool","guarantee","servicer","prepayment","credit","k-deal","multifamily"];
+    case "CMBS": return ["property","dscr","ltv","special servicer","watchlist","conduit","sasb"];
+    case "CLO": return ["oc test","ic test","portfolio","manager","rating","class a","tranche"];
+    case "MREIT":return ["strategy","portfolio","leverage","dividend","risk factors","governance"];
+    case "CORP": return ["business","risk factors","use of proceeds","governance","legal proceedings"];
+    default: return ["summary","overview","risk","portfolio","collateral"];
+  }
+}
+function extractUsefulSnippet_(text, keywords) {
+  if (!text) return "";
+  const lower = text.toLowerCase();
+  const n6Keywords = ["spill", "lawsuit", "emission", "penalty", "fine", "contamination", "disaster", "incident"];
+  const windows = [];
+  // Prioritize N6 keywords for oil/gas
+  for (let i = 0; i < n6Keywords.length; i++) {
+    const kw = n6Keywords[i];
+    const idx = lower.indexOf(kw);
+    if (idx !== -1) {
+      const start = Math.max(0, idx - 500);
+      const end = Math.min(text.length, idx + 1400);
+      windows.push(text.substring(start, end).trim());
+      if (windows.length >= 2) break;
+    }
+  }
+  // Fall back to general keywords if no N6 hits
+  if (windows.length === 0) {
+    for (let i = 0; i < keywords.length; i++) {
+      const kw = keywords[i].toLowerCase();
+      const idx = lower.indexOf(kw);
+      if (idx !== -1) {
+        const start = Math.max(0, idx - 500);
+        const end = Math.min(text.length, idx + 1400);
+        windows.push(text.substring(start, end).trim());
+        if (windows.length >= 2) break;
+      }
+    }
+  }
+  if (windows.length) return windows.join("\n...\n");
+  return text.substring(0, 1200).trim();
+}
+/** Parse SEC "company filings" Atom XML OR fallback HTML into [{title, link}] */
+function parseAtomEntries_(xmlText) {
+  if (!xmlText) return [];
+  try {
+    // Strip DOCTYPE to avoid parse errors
+    xmlText = xmlText.replace(/<!DOCTYPE[^>]*>/i, '').trim();
+    const doc = XmlService.parse(xmlText);
+    const root = doc.getRootElement();
+    const ns = root.getNamespace() || XmlService.getNamespace("http://www.w3.org/2005/Atom");
+    let entries = root.getChildren("entry", ns);
+    if (entries.length === 0) {
+      // Fallback: Try without NS
+      entries = root.getChildren("entry");
+    }
+    Logger.log("parseAtomEntries_: found %s entries", entries.length);
+    return entries.map(e => ({
+      title: getChildTextSafe_(e, "title", ns) || "",
+      link: getHrefSafe_(e, ns) || "",
+      updated: getChildTextSafe_(e, "updated", ns) || ""
+    })).filter(e => e.link); // Only with links
+  } catch (err) {
+    Logger.log("parseAtomEntries_ XML error: %s; trying string parse", err);
+    // Fallback: Regex extract from string
+    const entryRe = /<entry[^>]*>([\s\S]*?)<\/entry>/gi;
+    const entries = [];
+    let match;
+    while ((match = entryRe.exec(xmlText)) !== null) {
+      const entryText = match[1];
+      const titleMatch = entryText.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const linkMatch = entryText.match(/<link[^>]*href="([^"]+)"[^>]*>/i);
+      if (linkMatch) {
+        entries.push({
+          title: titleMatch ? titleMatch[1].trim() : "",
+          link: linkMatch[1],
+          updated: ""
+        });
+      }
+    }
+    Logger.log("parseAtomEntries_: string fallback found %s entries", entries.length);
+    return entries.filter(e => e.link && /\/Archives\//i.test(e.link));
+  }
+}
+// Helpers
+function getChildTextSafe_(elem, childName, ns) {
+  const child = elem.getChild(childName, ns);
+  return child ? child.getText() : "";
+}
+function getHrefSafe_(elem, ns) {
+  const link = elem.getChild("link", ns);
+  return link ? link.getAttribute("href")?.getValue() : "";
+}
+/* ===================== PERPLEXITY (strict sources) ===================== */
+function callPerplexitySummarize_(profile, row, evidence) {
+  const apiKey = getApiKey_("PERPLEXITY_API_KEY");
+  const url = "https://api.perplexity.ai/chat/completions";
+  const allowed = evidence.filter(e => {
+    const u = (e.url || "").toLowerCase();
+    return u.startsWith("https://www.sec.gov/archives/") ||
+           u.includes("ratings.moodys.com") || u.includes("moodys.com") ||
+           u.includes("fitchratings.com") || u.includes("spglobal.com") ||
+           u.includes("kbra.com");
+  });
+  const filingsCitationsBlock = allowed.map((e,i)=>`[${i+1}] ${e.title} (${e.url})`).join("\n");
+  const filingsSnippetsBlock = allowed.map((e,i)=>`[${i+1}] ${e.snippet}`).join("\n\n");
+  // Web search for external negatives, tailored for small-caps
+  const issuer = row["ID_BB_ULTIMATE_PARENT_CO_NAME"] || row["NAME"];
+  const webPrompt = `Search for negative controversies (N1-N10) for ${issuer} from 2023-2025. For small-caps/BDCs (e.g., Trinity Capital), include industry trends (BDC portfolio risks). Use credible sources (Reuters, Bloomberg, SEC litigation, ESG reports). Return top 3 snippets: [1] title (url) snippet, [2] title (url) snippet, [3] title (url) snippet.`;
+  Logger.log(`Web prompt for ${issuer}: ${webPrompt}`);
+  const webResult = callAIForEnrichment_(webPrompt, /Trinity|small-cap|BDC/i.test(issuer) ? "grok" : LANE1_MODEL_WEB) || { choices: [{ message: { content: "[none]" } }] };
+  Logger.log(`Web result raw: ${JSON.stringify(webResult)}`);
+  const webContent = webResult.choices?.[0]?.message?.content?.trim() || "[none]";
+  const webSnippets = webContent.match(/\[(\d+)\]\s+(.+?)\s+\((https?:\/\/[^\)]+)\)\s+(.+)/g) || ["[none]"];
+  Logger.log(`Parsed web snippets: ${webSnippets.join("\n")}`);
+  const webSnippetsBlock = webSnippets.length > 1 ? webSnippets.join("\n") : "[none]";
+  const schema = `{
+    "negative_score": number,
+    "fas": number,
+    "decision": "Pass"|"Review"|"Exclude",
+    "reasons":["bullet1","bullet2"],
+    "risk_flags":["flag1","flag2"],
+    "citations":[{"title":"...","url":"..."}],
+    "confidence":0.0-1.0
+  }`;
+  const systemPrompt = [
+    "You are an AI analyst for a faith-based fixed-income ETF implementing the Negative Alignment Methodology from the Faith Alignment Framework.",
+    "Return STRICT JSON only (no markdown).",
+    "Use Lane 1 filings snippets and web search results. Base analysis on both, prioritizing verifiable indicators from credible sources.",
+    "If data is sparse (e.g., <5 sources total), assume small-cap or niche security, infer from parent company or industry norms (e.g., BDC portfolio risk averages for Trinity), and set confidence 0.5-0.7 with 'Data-Light Review' if uncertain.",
+    "For tech firms (e.g., Apple), screen N6 Environmental Abuse Causing Human Harm using ESG disclosures (e.g., supply chain emissions, e-waste) if unmitigated within 60 months, unless net-zero verified.",
+    "Do not search beyond provided data. If no negative indicators, set negative_score=0, fas=50, decision='Pass', with up to 2 reasons like 'No evidence of [taxonomy category]'.",
+    "Current date: October 16, 2025 for recency.",
+    "Scan for indicators: N1-N10. Assign severity, materiality (full 1, partial 0.5, minimal 0.2), recency (1 within 60m, 0.7 cooled 24m, 0 removed 60m).",
+    "Negative Taxonomy:",
+    "N1 Life-Harm & Exploitation: Direct participation in activities that materially harm human life or dignity. Indicators: Abortion provision/manufacturing; assisted suicide; trafficking; child sexual exploitation; predatory lending. Materiality: ≥1% revenue or principal exposure; controlling role; or substantiated enforcement. Severity pts: Minor 6, Moderate 12, Severe 20. Cap 22",
+    "N2 Addiction Industries: Products or venues driving dependency and social harm. Indicators: Tobacco, vaping, recreational cannabis, gambling, adult entertainment. Materiality: ≥5% revenue/exposure; tenancy ≥10% of NOI; top-5 obligor in ABS. Severity pts: Minor 3, Moderate 8, Severe 14. Cap 16",
+    "N3 Coercive Regimes & Sanctions: Material ties to regimes under sanctions or SDN entities. Indicators: SOE bonds; sanctioned counterparties; state security suppliers. Materiality: ≥5% revenue/assets or key supplier/tenant; any SDN tie = Severe. Severity pts: Minor 4, Moderate 10, Severe 18. Cap 20",
+    "N4 Targeted Discrimination: Unlawful discrimination or suppression of fundamental civil rights. Indicators: Documented practices, legal judgments, regulatory sanctions. Materiality: ≥2 substantiated incidents in 36 months or one consent decree. Severity pts: Minor 4, Moderate 8, Severe 14. Cap 16",
+    "N5 Predatory Consumer Finance: Usury, fee-gouging, abusive servicing, deceptive marketing. Indicators: APRs beyond caps, repeat CFPB actions, junk fees. Materiality: ≥10% of receivables; or ≥1 major enforcement in 36 months. Severity pts: Minor 5, Moderate 10, Severe 16. Cap 18",
+    "N6 Environmental Abuse Causing Human Harm: Illegal dumping or catastrophic negligence with human impact. Indicators: Final judgments, consent decrees, incidents causing fatalities; for tech, supply chain emissions/e-waste if unmitigated. Materiality: 1 major event in 60 months. Severity pts: Minor 3, Moderate 8, Severe 14. Cap 16 (escalate to 20 for oil/gas or tech if unmitigated)",
+    "N7 Deceptive Practices & Corruption: Fraud, bribery, accounting manipulation. Indicators: SEC/DoJ actions; restatements tied to misconduct. Materiality: Any criminal charge or settled action. Severity pts: Minor 5, Moderate 10, Severe 16. Cap 18",
+    "N8 Pornography & Sexual Exploitation Supply Chain: Creation/monetization of exploitative explicit content. Indicators: Production, distribution, monetization of exploitative content. Materiality: ≥1% revenue/exposure, or collateral NOI ≥10%. Severity pts: Minor 4, Moderate 9, Severe 15. Cap 16",
+    "N9 Weaponry Outside Legitimate Defense: Indiscriminate or banned weapon systems. Indicators: Cluster munitions, landmines, chemical/biological agents. Materiality: Any revenue exposure. Severity pts: Minor 6, Moderate 12, Severe 20. Cap 22",
+    "N10 Governance Failure With Moral Externalities: Repeated board-level failures enabling harm. Indicators: ≥2 board failures tied to harm categories. Materiality: Two events in 36 months. Severity pts: Minor 3, Moderate 7, Severe 12. Cap 12",
+    "For securitized: Pool ≥10% flagged=Minor, ≥20% Moderate, ≥35% Severe. Top exposure ≥10%=Moderate min. Servicer maps to N5/N7. Drift moves Pass to Review.",
+    "Lookback: 60m for N1,N6,N9; 36m others.",
+    "Computation: V = min(severity_pts * materiality * recency, cap) per finding. C = min(sum V, cap) per category. T = sum C. k = categories with C>0. B = 1 + min(0.08*(k-1), 0.32). T_b = T * B. N = Math.floor(49 * Math.log(1 + T_b) / Math.log(121)). fas = N > 0 ? 50 - N : 50. Decision: Exclude if Severe N1/N9 or N>=35; Review if Moderate N1/N9 or Severe else or 20<=N<35 or drift; Pass if N<20 no Severe."
+  ].join("\n");
+  const userPrompt = `
+Filings Snippets:
+${filingsSnippetsBlock || "[none]"}
+Web Snippets:
+${webSnippetsBlock}
+Return strictly this JSON schema (citations from both blocks):
+${schema}
+`;
+  try {
+    const resp = UrlFetchApp.fetch(url, {
+      method: "post",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      payload: JSON.stringify({
+        model: LANE1_MODEL_FILINGS, // sonar-pro for filings base
+        temperature: 0,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        stream: false
+      }),
+      muteHttpExceptions: true
+    });
+    const code = resp.getResponseCode();
+    if (code < 200 || code >= 300) throw new Error(`Perplexity error ${code}: ${resp.getContentText()}`);
+    const data = JSON.parse(resp.getContentText());
+    const content = data.choices?.[0]?.message?.content?.trim() || "";
+    Logger.log(`Raw AI response: ${content}`);
+    const parsed = extractJson_(content) || {};
+    if (!parsed.negative_score && parsed.decision === "Pass") {
+      parsed.negative_score = 0;
+    }
+    // Merge citations and citationsUsed into citations
+    parsed.citations = (parsed.citations || []).concat(evidence.map(e => ({ title: e.title, url: e.url })));
+    return parsed;
+  } catch (err) {
+    Logger.log(`AI lane error: ${err}`);
+    return { decision: "Review", reasons: ["AI lane error"], confidence: 0 };
+  }
+}
+/* ===================== AI ENRICHMENT: CALLER ===================== */
+function callAIForEnrichment_(prompt) {
+  try {
+    const apiKey = getApiKey_("PERPLEXITY_API_KEY");
+    const url = "https://api.perplexity.ai/chat/completions";
+    const payload = {
+      model: ENRICH_MODEL,
+      temperature: SAFE_MODE ? 0.2 : 0.35,
+      messages: [
+        { role: "system", content:
+`You are a financial + ethical research assistant for a faith-based fixed-income portfolio.
+Return STRICT JSON only (no markdown). Scores must be 0.0..1.0. Keep sources as URLs or clear titles.
+If uncertain, use null and keep verdict="Needs-Review".`
+        },
+        { role: "user", content: prompt }
+      ],
+      stream: false
+    };
+    const resp = UrlFetchApp.fetch(url, {
+      method: "post",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    const code = resp.getResponseCode();
+    if (code < 200 || code >= 300) throw new Error(`AI enrichment error ${code}: ${resp.getContentText()}`);
+    const data = JSON.parse(resp.getContentText());
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+    return extractJson_(content); // you already have extractJson_ helper
+  } catch (e) {
+    Logger.log("❌ callAIForEnrichment_ error: " + e);
+    return null;
+  }
+}
+/* ===================== AI ENRICHMENT: PER-ROW ===================== */
+function enrichRowWithAI_(row) {
+  const issuer = String(row["Issuer_Name"] || row["Issuer_Parent"] || "").trim();
+  const cusip = String(row["CUSIP"] || "").trim();
+  const isin = String(row["ISIN"] || "").trim();
+  const deal = String(row["Deal_Name"] || "").trim();
+  const type = String(row["Type"] || "").trim();
+  const identity = [
+    issuer ? `Issuer: ${issuer}` : "",
+    cusip ? `CUSIP: ${cusip}` : "",
+    isin ? `ISIN: ${isin}` : "",
+    deal ? `Deal: ${deal}` : "",
+    type ? `Type: ${type}` : ""
+  ].filter(Boolean).join(" | ");
+  const prompt = `
+Build a compact entity profile for fixed-income screening using open web (news, ESG/CSR, sanctions, lawsuits, watchdogs, blogs), *not just SEC*.
+Entity: ${identity}
+Return strictly JSON:
+{
+  "financial_score": 0.0-1.0 or null,
+  "financial_verdict": "Include"|"Exclude"|"Needs-Review",
+  "financial_evidence": "1-3 bullets",
+  "financial_sources": ["..."],
+  "ethical_score": 0.0-1.0 or null,
+  "ethical_verdict": "Include"|"Exclude"|"Needs-Review",
+  "ethical_evidence": "1-3 bullets",
+  "ethical_sources": ["..."],
+  "reputation_score": 0.0-1.0 or null,
+  "reputation_verdict": "Include"|"Exclude"|"Needs-Review",
+  "reputation_evidence": "1-3 bullets",
+  "reputation_sources": ["..."]
+}`;
+  Logger.log(`🤖 Enrich (AI) ${issuer || cusip || deal || "[unknown]"}`);
+  const r = callAIForEnrichment_(prompt);
+  if (!r) {
+    return [
+      cusip, issuer, deal, type,
+      "", "", "", "",
+      "", "", "", "",
+      "", "", "", "",
+      "", ENRICH_MODEL, new Date()
+    ];
+  }
+  const finS = coerce01_(r.financial_score);
+  const ethS = coerce01_(r.ethical_score);
+  const repS = coerce01_(r.reputation_score);
+  const comp = average01_([finS, ethS, repS]);
+  return [
+    cusip, issuer, deal, type,
+    finS, String(r.financial_verdict || "Needs-Review"), String(r.financial_evidence || ""), (r.financial_sources || []).join(" • "),
+    ethS, String(r.ethical_verdict || "Needs-Review"), String(r.ethical_evidence || ""), (r.ethical_sources || []).join(" • "),
+    repS, String(r.reputation_verdict || "Needs-Review"), String(r.reputation_evidence || ""), (r.reputation_sources || []).join(" • "),
+    comp, ENRICH_MODEL, new Date()
+  ];
+}
+// small helpers
+function coerce01_(x) {
+  const n = Number(x);
+  if (isNaN(n)) return "";
+  return Math.max(0, Math.min(1, Math.round(n * 100) / 100));
+}
+function average01_(arr) {
+  const nums = arr.map(Number).filter(x => !isNaN(x));
+  if (!nums.length) return "";
+  const s = nums.reduce((a,b)=>a+b,0)/nums.length;
+  return Math.round(s * 100) / 100;
+}
+/* ========== Lane 2: Positive Alignment ========== */
+function callEthicsAI_(row) {
+  const identity = buildEntityHeader_(row);
+  const type = row["Type"] || "";
+  const isSecuritized = /ABS|MBS|CMBS|CLO/.test(type.toUpperCase());
+  const lane1Snippets = row["lane1Snippets"] || "[none]";
+  const prompt = `
+From Lane 1 (negative alignment): Clean base with negative_score: 0, fas: 50, decision: Pass. Use this and Lane 1 snippets for positives: ${lane1Snippets}
+You are implementing the Positive Alignment Methodology from the Faith Alignment Framework for a faith-based ETF.
+Assume no negative findings (handled in Lane 1).
+Use Lane 1 filings snippets, plus open web/news/ESG/CSR/company sites, to find independently verifiable positive indicators from the last 36 months. Require 10+ sources total, with 2-4 per pillar for depth. Cross-verify, quantify metrics (e.g., % coverage, rates vs industry), analyze trends 2023-2025, and cite specifics. For small-cap or niche securities (e.g., BDCs like Trinity Capital), use parent/issuer ESG reports, Glassdoor, IR pages, or industry benchmarks if bond-specific data is scarce—flag as 'Data-Light' if <5 sources.
+Current date: October 16, 2025.
+Entity: ${identity}
+Pillars:
+P1 Stewardship of Workers & Suppliers: Dignity, safety, fair treatment. Indicators: Recordable incident rate vs industry (q=0.9 excellent, 0.5 average, 0.3 poor, 0.1 bad if violations); living-wage coverage; supplier code adoption; vendor audits. Cap 10
+P2 Community & Customer Wellbeing: Tangible benefit to communities/customers. Indicators: Affordable access programs; product safety recalls rate (inverse); complaint resolution time; verified philanthropy % EBIT. Cap 10
+P3 Environmental Stewardship Tied to Human Good: Care reducing human risk. Indicators: Scope 1+2 intensity vs industry; water stress mitigation; hazardous incidents avoided; third-party certifications. Cap 10
+P4 Governance Integrity & Transparency: Structures reducing harm/enabling trust. Indicators: Independent board share; anti-corruption controls; whistleblower cases resolved; audit restatements (inverse). Cap 10
+P5 Faith-Consistent Initiatives: Programs aligned with faith-based care. Indicators: Verified chaplaincy/employee care; paid volunteer hours; faith-consistent philanthropy without exclusion. Cap 10
+For each pillar, find 1-3 indicators, estimate industry-relative percentile q (0-1: excellent 0.9, good 0.7, average 0.5, poor 0.3, bad 0.1, no data 0).
+s = min(1, max(0, (q-0.10)/0.80)) per indicator.
+Apply quality: *1.0 audited, *0.95 verified, *0.90 reported, *0.5 if violations confirmed.
+P = cap * average(s) per pillar.
+U = sum P max 50
+m = pillars with P >=6
+BB = min(0.5 * m, 2.0)
+U_b = min(U + BB, 50)
+positive_index = U_b
+fas = min(50 + positive_index, 100)
+Decision: Exemplary if fas>=85 >=4 pillars>=7 none<5; Aligned 70-84 >=3>=6; Baseline Pass 60-69 >=2>=5; Data-Light Pass 55-59; else Needs-Review
+Return STRICT JSON:
+{
+  "positive_index": number,
+  "fas": number,
+  "decision": "Exemplary"|"Aligned"|"Baseline Pass"|"Data-Light Pass"|"Needs-Review",
+  "reasons":["bullet1","bullet2"],
+  "risk_flags":["flag1","flag2"],
+  "citations":[{"title":"...","url":"..."}],
+  "confidence":0.0-1.0
+}
+`;
+  const result = callAIForEnrichment_(prompt, LANE2_MODEL);
+  return result || { decision: "Needs-Review", reasons: ["Positive AI failed"], confidence: 0 };
+}
+/* ===================== PROFILES / PREFLIGHT ===================== */
+function getTypeProfile_(type) {
+  const base = (topic) => `${topic}
+Evaluate using the Faith Alignment Framework's Negative Methodology on provided snippets. Focus on collateral/payor for structured.`;
+  switch (type) {
+    case "ABS": return { name: "ABS", policy: base("Screen ABS: collateral quality, servicer, delinquencies/charge-offs, enhancement. Tailored negative taxonomy for predatory ABS.") };
+    case "MBS": return { name: "MBS", policy: base("Screen MBS: pool composition, servicer practices, prepayment/credit trends.") };
+    case "CMBS": return { name: "CMBS", policy: base("Screen CMBS: tenant/obligor profiles, property types, watchlist.") };
+    case "CLO": return { name: "CLO", policy: base("Screen CLO: portfolio exposures, manager, tests.") };
+    case "MREIT":return { name: "MREIT",policy: base("Screen MREIT: strategy, leverage, governance.") };
+    case "CORP": return { name: "Corp", policy: base("Screen corporate: business activities, ties to exclusions.") };
+    default: return { name: "Unknown", policy: base("Unknown type; likely Review.") };
+  }
+}
+function preflightCheck_(type, row) {
+  const hasCUSIP = String(row["CUSIP"] || "").trim().length > 0;
+  const hasTicker = String(row["Ticker"] || "").trim().length > 0;
+  const hasIssuer = String(row["Issuer_Name"] || "").trim().length > 0;
+  const hasDeal = String(row["Deal_Name"] || "").trim().length > 0;
+  const hasDepositor = String(row["Depositor/Issuer_Legal"] || "").trim().length > 0;
+  switch (type) {
+    case "ABS":
+    case "MBS":
+    case "CLO":
+    case "CMBS":
+      if (!hasCUSIP && !hasDeal && !hasIssuer && !hasDepositor)
+        return { ok: false, reason: "Missing identifier: need CUSIP or Deal_Name or Issuer_Name or Depositor/Issuer_Legal." };
+      break;
+    case "MREIT":
+      if (!hasTicker && !hasIssuer)
+        return { ok: false, reason: "Missing Ticker or Issuer_Name for MREIT." };
+      break;
+    case "CORP":
+      if (!hasCUSIP && !hasIssuer)
+        return { ok: false, reason: "Missing CUSIP or Issuer_Name for Corporate." };
+      break;
+    default:
+      return { ok: false, reason: "Unknown Type; cannot run profile." };
+  }
+  return { ok: true, reason: "" };
+}
+/* ===================== OUTPUT + UTILITIES ===================== */
+function buildOutput_(opts) {
+  opts = opts || {};
+  const json = opts.json || {};
+  const decision = opts.decision || json.decision || "Review";
+  const decisionOverride = opts.decisionOverride || "";
+  const reasons = opts.reasons || "";
+  const reasonsAppend = opts.reasonsAppend || "";
+  const citationsPretty = opts.citationsPretty || "";
+  const typeProfile = opts.typeProfile || "";
+  const rawJson = opts.rawJson || json;
+  const joinBullets = (v) => Array.isArray(v) ? v.join(" • ") : (v || "");
+  return {
+    negative_score: json.negative_score || 0,
+    fas: json.fas || "",
+    decision: decisionOverride || decision,
+    reasons: [joinBullets(json.reasons), reasons, reasonsAppend].filter(Boolean).join(" • "),
+    risk_flags: joinBullets(json.risk_flags),
+    citations: citationsPretty || joinBullets(json.citations ? json.citations.map(c => `${c.title || "Filing"} (${c.url || ""})`) : []),
+    confidence: (json.confidence != null ? json.confidence : ""),
+    type_profile_used: typeProfile,
+    raw_json: safeStringify_(rawJson)
+  };
+}
+function getHeaders_(sheet) {
+  return sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+}
+function ensureOutputHeaders_(sheet, headers) {
+  if (!headers.includes("negative_score")) {
+    const existingHeaders = headers || [];
+    const newHeaders = OUTPUT_HEADERS.filter(h => !existingHeaders.includes(h));
+    if (newHeaders.length > 0) {
+      sheet.getRange(1, existingHeaders.length + 1, 1, newHeaders.length).setValues([newHeaders]);
+    }
+  }
+}
+function rowToObj_(arr, headers) { const o = {}; headers.forEach((h,i)=>o[h]=arr[i]); return o; }
+function buildEntityHeader_(row) {
+  const fields = [
+    ["Type", row["Type"]],["CUSIP", row["CUSIP"]],["Issuer_Name", row["Issuer_Name"]],
+    ["Deal_Name", row["Deal_Name"]],["Tranche", row["Tranche"]],["Ticker", row["Ticker"]],
+    ["Sector", row["Sector"]],["Subsector/Industry", row["Subsector/Industry"]],
+    ["Collateral_Type", row["Collateral_Type"]],["Sponsor/Originator", row["Sponsor/Originator"]],
+    ["Depositor/Issuer_Legal", row["Depositor/Issuer_Legal"]],["Servicer", row["Servicer"]],
+    ["Trustee", row["Trustee"]],["Strategy_Focus", row["Strategy_Focus"]],
+    ["Estimated_Leverage_X", row["Estimated_Leverage_X"]],["CLO_Name", row["CLO_Name"]],
+    ["CLO_Manager", row["CLO_Manager"]],["CLO_Vintage_Year", row["CLO_Vintage_Year"]],
+    ["CLO_Tranche", row["CLO_Tranche"]],["CMBS_Type", row["CMBS_Type"]],
+    ["Top_Property_Types", row["Top_Property_Types"]],["Notes_Researcher", row["Notes_Researcher"]],
+    ["AsOf_Date", row["AsOf_Date"]]
+  ];
+  return fields.map(([k,v]) => `- ${k}: ${v || ""}`).join("\n");
+}
+function extractJson_(text) {
+  try { return JSON.parse(text); } catch(e){}
+  const fenced = text.match(/```json\s*([\s\S]*?)```/i);
+  if (fenced) { try { return JSON.parse(fenced[1]); } catch(e){} }
+  const brace = text.match(/\{[\s\S]*\}$/m);
+  if (brace) { try { return JSON.parse(brace[0]); } catch(e){} }
+  return {};
+}
+function safeStringify_(obj) { try { return JSON.stringify(obj); } catch(e){ return ""; } }
+function prettyFormat_(sheet) {
+  const lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return;
+  sheet.setFrozenRows(1);
+  const hdr = sheet.getRange(1,1,1,lastCol); hdr.setFontWeight("bold");
+  const all = sheet.getRange(1,1,Math.max(2,lastRow),lastCol); all.setWrap(true);
+  const widths = {
+    "Type":90,"CUSIP":120,"Issuer_Name":220,"Deal_Name":240,"Tranche":90,"Ticker":90,"Sector":120,"Subsector/Industry":170,
+    "Collateral_Type":160,"Sponsor/Originator":160,"Depositor/Issuer_Legal":200,"Servicer":150,"Trustee":150,
+    "Strategy_Focus":170,"Estimated_Leverage_X":150,"CLO_Name":190,"CLO_Manager":170,"CLO_Vintage_Year":140,"CLO_Tranche":120,
+    "CMBS_Type":130,"Top_Property_Types":190,"Notes_Researcher":230,"AsOf_Date":110,
+    "negative_score":130,"positive_index":140,"fas":130,
+    "decision":120,"reasons":420,
+    "risk_flags":230,"citations":520,"confidence":110,"type_profile_used":160,"raw_json":520,"review_verdict":140,"reviewed_by":140,"review_notes":240
+  };
+  const headers = sheet.getRange(1,1,1,lastCol).getValues()[0];
+  headers.forEach((h,i)=>sheet.setColumnWidth(i+1, widths[h] || 140));
+  try { sheet.getRange(1,1,Math.max(2,lastRow),lastCol).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY); } catch(e){}
+}
+function autoFormat_(sheet) {
+  prettyFormat_(sheet); // reuse your existing formatter
+}
+function dedupeByUrl_(arr) {
+  const seen = new Set(); const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    const x = arr[i];
+    if (!x || !x.url) continue;
+    const k = x.url.trim();
+    if (seen.has(k)) continue;
+    seen.add(k); out.push(x);
+  }
+  return out;
+}
+function alert_(m) { SpreadsheetApp.getUi().alert(m); }
+function getApiKey_(keyName) {
+  const val = PropertiesService.getScriptProperties().getProperty(keyName);
+  if (!val) throw new Error("Missing script property: " + keyName);
+  return val.trim();
+}
+function verifyConnections_() {
+  const base = getProxyBase_();
+  const key = getApiKey_("PERPLEXITY_API_KEY");
+  Logger.log("Checking proxy and AI endpoints...");
+  try {
+    const ping = UrlFetchApp.fetch(base + "/fetch?url=" + encodeURIComponent("https://www.sec.gov"), { muteHttpExceptions: true });
+    Logger.log("Proxy response code: %s length: %s", ping.getResponseCode(), ping.getContentText().length);
+  } catch(e) {
+    Logger.log("Proxy check failed: " + e);
+  }
+  try {
+    const testPayload = {
+      model: PPLX_MODEL,
+      messages: [{ role: "user", content: "Return JSON {\"ok\":true}" }],
+      temperature: 0
+    };
+    const resp = UrlFetchApp.fetch("https://api.perplexity.ai/chat/completions", {
+      method: "post",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      payload: JSON.stringify(testPayload),
+      muteHttpExceptions: true
+    });
+    Logger.log("Perplexity code=%s len=%s", resp.getResponseCode(), resp.getContentText().length);
+  } catch(e) {
+    Logger.log("Perplexity check failed: " + e);
+  }
+}
+/* ===================== DIAGNOSTICS ===================== */
+function printScriptProperties() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  Logger.log(JSON.stringify(props, null, 2));
+  if (!props.PROXY_BASE) throw new Error("Missing PROXY_BASE script property");
+  if (!props.PERPLEXITY_API_KEY) Logger.log("Warning: PERPLEXITY_API_KEY not set.");
+}
+function diag_pingProxy() {
+  const base = getProxyBase_();
+  const testUrl = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&output=atom&count=10&company=Apple";
+  const url = base + "/fetch?url=" + encodeURIComponent(testUrl);
+  const r = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  Logger.log("Proxy /sec.gov code=%s len=%s", r.getResponseCode(), r.getContentText().length);
+}
+function diag_atomAnnaly10K() {
+  const xml = proxyCompanyAtom_("Annaly Capital Management", "10-K");
+  Logger.log("Annaly 10-K Atom length: " + (xml ? xml.length : 0));
+  const entries = parseAtomEntries_(xml);
+  Logger.log("Entries: " + entries.length);
+  if (entries[0]) Logger.log("First link: " + entries[0].link);
+}
+function diag_searchSample() {
+  const html = proxyHtmlSearch_('"GSMS 2024-GC47" OR "FREMF 2024-K151"', "FWP|424B5|10-D");
+  const links = extractArchivesLinks_(html);
+  Logger.log("Search links found: " + links.length + (links[0] ? " first=" + links[0] : ""));
+}
+function diag_debugRow2() { debugRow(2); }
+function diag_debugRow3() { debugRow(3); }
+function debugRow(rowNumber) {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const rowVals = sheet.getRange(rowNumber, 1, 1, headers.length).getValues()[0];
+  const rawRow = {}; headers.forEach((h, i) => rawRow[h] = rowVals[i]);
+  // 🔍 Normalize and log what the script "sees" from your portfolio data
+  const row = logNormalizedRow_(rawRow); // calls your normalizeRowHeaders_()
+  Logger.log("🔍 Normalized Row:");
+  Object.keys(row).forEach(k => Logger.log(" %s = %s", k, row[k]));
+  const type = inferTypeFromRow_(row);
+  Logger.log("Type='%s' Issuer='%s' Depositor='%s' Deal='%s' CUSIP='%s'",
+             type, row["Issuer_Name"], row["Depositor/Issuer_Legal"], row["Deal_Name"], row["CUSIP"]);
+  const start = Date.now();
+  const candidates = fetchEvidenceForRow_(row, type) || [];
+  writeCIKToSheet_(sheet, rowNumber, getCachedCIK_(row["Issuer_Name"] || row["Issuer_Parent"]));
+  Logger.log("candidates=%s (in %sms)", candidates.length, Date.now() - start);
+  candidates.slice(0, 10).forEach((c, i) => Logger.log("[%s] %s %s", i + 1, c.form || "?", c.url));
+  if (!candidates.length) {
+    Logger.log("No candidates. Broad tests:");
+    if (row["Issuer_Name"]) {
+      const xmlAny = proxyCompanyAtom_(String(row["Issuer_Name"]), "");
+      Logger.log("issuer-any atom length=%s entries=%s",
+        xmlAny ? xmlAny.length : 0, parseAtomEntries_(xmlAny).length);
+    }
+    if (row["Depositor/Issuer_Legal"]) {
+      const xmlDep = proxyCompanyAtom_(String(row["Depositor/Issuer_Legal"]), "");
+      Logger.log("depositor-any atom length=%s entries=%s",
+        xmlDep ? xmlDep.length : 0, parseAtomEntries_(xmlDep).length);
+    }
+    const forms = "FWP|424B5|424B3|424B2|10-D|8-K|ABS-15G";
+    // Build smarter SEC search query
+    const q = buildSecQuery_(row, type);
+    if (q) {
+      const html = proxyHtmlSearch_(q, forms);
+      const links = extractArchivesLinks_(html);
+      Logger.log("search '%s' -> links=%s", q, links.length);
+      links.slice(0, 10).forEach((u, i) => Logger.log("search[%s] %s", i + 1, u));
+    } else {
+      Logger.log("No identifiers available for search fallback.");
+    }
+  }
+}
+function diag_resolveAndSnippet_row2_first() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const headers = getHeaders_(sheet);
+  const rowVals = sheet.getRange(2, 1, 1, headers.length).getValues()[0];
+  const row = {}; headers.forEach((h,i)=>row[h]=rowVals[i]);
+  const type = inferTypeFromRow_(row);
+  const candidates = fetchEvidenceForRow_(row, type) || [];
+  if (!candidates.length) { Logger.log("No candidates to resolve."); return; }
+  Logger.log("Candidates: " + candidates.length);
+  Logger.log("C1 index: " + candidates[0].url);
+  const primary = resolvePrimaryDocUrl_(candidates[0].url, candidates[0].form);
+  Logger.log("Primary resolved: " + primary);
+  const html = proxyFetchHtml_(primary);
+  Logger.log("HTML length: " + (html ? html.length : 0));
+  const text = stripHtml_(html);
+  Logger.log("Text length: " + text.length);
+  const snippet = extractUsefulSnippet_(text, snippetKeywordsForType_(type));
+  Logger.log("Snippet length: " + (snippet ? snippet.length : 0));
+  Logger.log("Snippet preview: " + (snippet ? snippet.substring(0, 500) : "<empty>"));
+}
+function diag_tryAll_row2() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const headers = getHeaders_(sheet);
+  const rowVals = sheet.getRange(2, 1, 1, headers.length).getValues()[0];
+  const row = {}; headers.forEach((h,i)=>row[h]=rowVals[i]);
+  const type = inferTypeFromRow_(row);
+  const candidates = fetchEvidenceForRow_(row, type) || [];
+  if (!candidates.length) { Logger.log("No candidates."); return; }
+  Logger.log("Candidates: " + candidates.length);
+  const ev = candidates[0];
+  const got = fetchPrimaryWithFallback_(ev.url, ev.form, type);
+  Logger.log("Tried primary+fallback");
+  Logger.log("Final URL: " + got.url);
+  Logger.log("HTML length: " + got.htmlLen);
+  Logger.log("Snippet length: " + (got.snippet ? got.snippet.length : 0));
+  Logger.log("Snippet preview: " + (got.snippet ? got.snippet.substring(0, 400) : "<empty>"));
+}
+/* ===================== PIPELINES (Clone + Lane1 + Enrich + Final) ===================== */
+function runAllPipelines() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const src = ss.getActiveSheet();
+  // 1) 🚫 keep original portfolio untouched → clone to new sheet
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss");
+  const dstName = "Screening_Run_" + stamp;
+  const dst = ss.insertSheet(dstName);
+  const values = src.getDataRange().getValues();
+  dst.getRange(1, 1, values.length, values[0].length).setValues(values);
+  dst.setFrozenRows(1);
+  try { dst.autoResizeColumns(1, values[0].length); } catch (_) {}
+  // switch context to the clone
+  ss.setActiveSheet(dst);
+  // 2) Lane 1 screening (SEC/Ratings)
+  runScreeningProxy();
+  // 3) Snapshot Lane1 → Sheet_Filings
+  lane1_copyToFilings_();
+  // 4) AI Enrichment (Stage 2) → Sheet_Enrichment
+  enrichment_runOnFilings_();
+  // 5) Lane 2: Positive Alignment AI → Sheet_Ethics
+  lane2_populateEthics_();
+  // 6) Combine → Sheet_Final
+  combine_toFinal_();
+  // 7) Niceties on the cloned source sheet
+  prettyFormat_(dst);
+  SpreadsheetApp.getUi().alert("✅ Pipelines complete.\n• Source clone: " + dstName + "\n• Lane1: " + SHEET_FILINGS + "\n• Enrichment: " + SHEET_ENRICH + "\n• Ethics: " + SHEET_ETHICS + "\n• Final: " + SHEET_FINAL);
+}
+function addEnrichmentVisuals_(sheet) {
+  const range = sheet.getDataRange();
+  // Conditional colors
+  const rules = sheet.getConditionalFormatRules();
+  const high = SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberGreaterThan(0.8)
+    .setBackground("#C6EFCE")
+    .setFontColor("#006100")
+    .setRanges([sheet.getRange("E2:E"), sheet.getRange("I2:I"), sheet.getRange("M2:M"), sheet.getRange("Q2:Q")])
+    .build();
+  const medium = SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberBetween(0.6, 0.8)
+    .setBackground("#FFEB9C")
+    .setFontColor("#9C6500")
+    .setRanges([sheet.getRange("E2:E"), sheet.getRange("I2:I"), sheet.getRange("M2:M"), sheet.getRange("Q2:Q")])
+    .build();
+  const low = SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberLessThan(0.6)
+    .setBackground("#FFC7CE")
+    .setFontColor("#9C0006")
+    .setRanges([sheet.getRange("E2:E"), sheet.getRange("I2:I"), sheet.getRange("M2:M"), sheet.getRange("Q2:Q")])
+    .build();
+  rules.push(high, medium, low);
+  sheet.setConditionalFormatRules(rules);
+  // Average summary at bottom
+  const lastRow = sheet.getLastRow() + 2;
+  sheet.getRange(lastRow, 4).setValue("AVERAGES:");
+  sheet.getRange(lastRow, 5).setFormula(`=AVERAGE(E2:E${sheet.getLastRow()})`);
+  sheet.getRange(lastRow, 9).setFormula(`=AVERAGE(I2:I${sheet.getLastRow()})`);
+  sheet.getRange(lastRow, 13).setFormula(`=AVERAGE(M2:M${sheet.getLastRow()})`);
+  sheet.getRange(lastRow, 17).setFormula(`=AVERAGE(Q2:Q${sheet.getLastRow()})`);
+  sheet.getRange(lastRow, 4, 1, 17).setFontWeight("bold").setBackground("#E0E0E0");
+  sheet.autoResizeColumns(1, sheet.getLastColumn());
+  sheet.setFrozenRows(1);
+}
+function lane1_copyToFilings_() {
+  const src = SpreadsheetApp.getActiveSheet();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dst = getOrCreateSheet_(SHEET_FILINGS);
+  const values = src.getDataRange().getValues();
+  if (values.length < 2) { dst.clear(); return; }
+  const wantCols = [
+    "Type","CUSIP","Issuer_Name","Deal_Name","Tranche","Ticker","AsOf_Date",
+    "negative_score","fas","decision","reasons","risk_flags","citations","confidence","type_profile_used","raw_json"
+  ];
+  const header = values[0];
+  const idxs = wantCols.map(c => header.indexOf(c));
+  const missing = idxs.some(i => i < 0);
+  let out;
+  if (missing) {
+    out = values; // best-effort copy
+  } else {
+    out = [wantCols];
+    for (let r = 1; r < values.length; r++) out.push(idxs.map(i => values[r][i]));
+  }
+  dst.clear();
+  dst.getRange(1,1,out.length, out[0].length).setValues(out);
+  autoFormat_(dst);
+}
+function lane2_populateEthics_() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  if (!sheet) throw new Error("No active sheet detected. Please select a sheet with bond data.");
+  Logger.log(`Processing data from sheet: ${sheet.getName()}`);
+  const ethics = getOrCreateSheet_(SHEET_ETHICS);
+  const data = sheet.getDataRange().getValues();
+  Logger.log(`Data rows found: ${data.length - 1}`);
+  if (data.length < 2) { ethics.clear(); return alert_("No data rows in active sheet."); }
+  const h = data[0];
+  const idxCUSIP = h.indexOf("CUSIP");
+  const idxIssuer = h.indexOf("ID_BB_ULTIMATE_PARENT_CO_NAME");
+  const idxDeal = h.indexOf("SECURITY DESCRIPTION");
+  const idxType = h.indexOf("Security Master Asset Group");
+  const idxRawJson = h.indexOf("raw_json"); // Lane 1 snippets
+  Logger.log(`Column indices: CUSIP=${idxCUSIP}, Issuer=${idxIssuer}, Deal=${idxDeal}, Type=${idxType}, RawJson=${idxRawJson}`);
+  if (idxCUSIP < 0 || idxIssuer < 0 || idxDeal < 0 || idxType < 0 || idxRawJson < 0) {
+    return alert_("Required headers (CUSIP, ID_BB_ULTIMATE_PARENT_CO_NAME, SECURITY DESCRIPTION, Security Master Asset Group, raw_json) not found.");
+  }
+  const outHdr = ["positive_index", "fas", "decision", "reasons", "risk_flags", "citations", "confidence", "type_profile_used", "raw_json"];
+  ethics.clear();
+  ethics.getRange(1, 1, 1, outHdr.length).setValues([outHdr]);
+  const rows = [];
+  for (let r = 1; r < data.length; r++) {
+    const rowObj = {
+      "CUSIP": idxCUSIP >= 0 ? data[r][idxCUSIP] : "",
+      "Issuer_Name": idxIssuer >= 0 ? data[r][idxIssuer] : "",
+      "Deal_Name": idxDeal >= 0 ? data[r][idxDeal] : "",
+      "Type": idxType >= 0 ? data[r][idxType] : "",
+      "lane1Snippets": idxRawJson >= 0 ? data[r][idxRawJson] : "" // Pass Lane 1 raw_json
+    };
+    Logger.log(`Processing row ${r + 1}: ${JSON.stringify(rowObj)}`);
+    const ethicsJson = callEthicsAI_(rowObj);
+    const outRow = buildOutput_({ json: ethicsJson, typeProfile: "Positive Alignment" });
+    rows.push([
+      outRow.positive_index || "", outRow.fas || "", outRow.decision || "",
+      outRow.reasons || "", outRow.risk_flags || "", outRow.citations || "", outRow.confidence || "",
+      outRow.type_profile_used || "", outRow.raw_json || ""
+    ]);
+    Utilities.sleep(300);
+    if (rows.length >= ENRICH_MAX_ROWS) break;
+  }
+  if (rows.length) {
+    ethics.getRange(2, 1, rows.length, outHdr.length).setValues(rows);
+    autoFormat_(ethics);
+  } else {
+    Logger.log("No rows processed.");
+  }
+  alert_("Lane 2 complete: Positive alignment updated.");
+}
+function combine_toFinal_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const filings = getOrCreateSheet_(SHEET_FILINGS);
+  const ethics = getOrCreateSheet_(SHEET_ETHICS);
+  const finalS = getOrCreateSheet_(SHEET_FINAL);
+  const F = filings.getDataRange().getValues();
+  const E = ethics.getDataRange().getValues();
+  if (F.length < 2) { finalS.clear(); return; }
+  const fh = F[0], eh = E.length ? E[0] : [];
+  const eMap = new Map();
+  for (let r = 1; r < E.length; r++) {
+    const row = arrToObj_(E[r], eh);
+    const key = primaryKey_(row["CUSIP"], row["Issuer_Name"], row["Deal_Name"]);
+    eMap.set(key, row);
+  }
+  const finalHdr = [
+    "CUSIP","Issuer_Name","Deal_Name","Type",
+    "L1_decision","L1_reasons","L1_risk_flags","L1_citations","L1_confidence","L1_fas",
+    "L2_decision","L2_reasons","L2_risk_flags","L2_citations","L2_confidence","L2_fas",
+    "Combined_decision","Combined_reasons","Combined_fas"
+  ];
+  const out = [finalHdr];
+  for (let r = 1; r < F.length; r++) {
+    const fo = arrToObj_(F[r], fh);
+    const key = primaryKey_(fo["CUSIP"], fo["Issuer_Name"], fo["Deal_Name"]);
+    const eo = eMap.get(key) || {};
+    const l1d = (fo["decision"] || "").toString();
+    const l2d = (eo["decision"] || "").toString();
+    const l1fas = Number(fo["fas"] || 0);
+    const l2fas = Number(eo["fas"] || 50);
+    let combined_fas = l1fas < 50 ? l1fas : l2fas;
+    let combined_decision = "Needs-Review";
+    let combined_reasons = [];
+    if (l1d !== "Pass") {
+      combined_decision = l1d;
+      combined_reasons.push("Lane 1 negative issue");
+    } else {
+      combined_decision = l2d || "Needs-Review";
+      combined_reasons.push(l2d ? "Lane 2 positive alignment" : "Positives pending");
+    }
+    out.push([
+      fo["CUSIP"] || "", fo["Issuer_Name"] || "", fo["Deal_Name"] || "", fo["Type"] || "",
+      l1d, fo["reasons"] || "", fo["risk_flags"] || "", fo["citations"] || "", fo["confidence"] || "", l1fas,
+      l2d, eo["reasons"] || "", eo["risk_flags"] || "", eo["citations"] || "", eo["confidence"] || "", l2fas,
+      combined_decision, combined_reasons.join(" • "), combined_fas
+    ]);
+  }
+  finalS.clear();
+  finalS.getRange(1,1,out.length, finalHdr.length).setValues(out);
+  autoFormat_(finalS);
+}
+/* ===================== PIPELINE: ENRICHMENT RUNNER ===================== */
+function enrichment_runOnFilings_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const filings = getOrCreateSheet_(SHEET_FILINGS);
+  const out = getOrCreateSheet_(SHEET_ENRICH);
+  const data = filings.getDataRange().getValues();
+  if (data.length < 2) { out.clear(); return; }
+  // header indices
+  const h = data[0];
+  const iCUSIP = h.indexOf("CUSIP");
+  const iIssuer = h.indexOf("Issuer_Name");
+  const iDeal = h.indexOf("Deal_Name");
+  const iType = h.indexOf("Type");
+  // write header
+  out.clear();
+  out.getRange(1,1,1,ENRICH_HEADERS.length).setValues([ENRICH_HEADERS]);
+  const limit = SAFE_MODE ? Math.min(ENRICH_MAX_ROWS, data.length - 1) : (data.length - 1);
+  const rows = [];
+  for (let r = 1; r < data.length && rows.length < limit; r++) {
+    const rowObj = {
+      "CUSIP": iCUSIP >= 0 ? data[r][iCUSIP] : "",
+      "Issuer_Name": iIssuer >= 0 ? data[r][iIssuer] : "",
+      "Deal_Name": iDeal >= 0 ? data[r][iDeal] : "",
+      "Type": iType >= 0 ? data[r][iType] : ""
+    };
+    rows.push(enrichRowWithAI_(rowObj));
+    Utilities.sleep(SAFE_MODE ? 200 : 120); // friendly pacing
+  }
+  if (rows.length) {
+    out.getRange(2,1,rows.length, ENRICH_HEADERS.length).setValues(rows);
+    autoFormat_(out); // you already have this helper
+    try { addEnrichmentVisuals_(out); } catch (e) { Logger.log("visuals error: " + e); }
+  }
+}
+/* ---------------- Pipelines helpers ---------------- */
+function writeCIKToSheet_(sheet, rowNumber, cik) {
+  if (!cik) return;
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  let col = headers.indexOf("Resolved_CIK") + 1;
+  if (col === 0) { // if missing, append header
+    col = headers.length + 1;
+    sheet.getRange(1, col).setValue("Resolved_CIK");
+  }
+  sheet.getRange(rowNumber, col).setValue(cik);
+}
+function diag_testCIK() {
+  const testNames = ["Ally Bank", "Hyundai Capital America", "Ford Motor Credit", "CarMax Auto Owner Trust"];
+  for (const name of testNames) {
+    const normalized = aiNormalizeIssuerName_(name);
+    const cik = autoResolveCIK_(normalized || name);
+    Logger.log("✅ %s → normalized: %s → CIK: %s", name, normalized, cik);
+  }
+}
+function getOrCreateSheet_(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+function arrToObj_(row, header) {
+  const o = {};
+  for (let i = 0; i < header.length; i++) o[header[i]] = row[i];
+  return o;
+}
+function primaryKey_(cusip, issuer, deal) {
+  const c = (cusip || "").toString().trim();
+  if (c) return "CUSIP:" + c;
+  return "ISSUER_DEAL:" + normalizeKey_(issuer) + "|" + normalizeKey_(deal);
+}
+function normalizeKey_(s) {
+  return (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/\s+/g," ")
+    .replace(/[^\w\s\-\|]/g,"")
+    .trim();
+}
+function buildFinalFiltered_NoTouchSheet3() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const source = ss.getSheetByName("Sheet3");
+  if (!source) throw new Error("Missing Sheet3. Not touching anything.");
+  const data = source.getDataRange().getValues();
+  if (data.length < 2) {
+    SpreadsheetApp.getUi().alert("Sheet3 has no data rows. Not touching it.");
+    return;
+  }
+  // Find decision column (be forgiving about header names)
+  const header = data[0].map(h => String(h || "").trim());
+  const candidates = [
+    "Combined Decision","Combined_decision","Combined",
+    "Final Decision","Final_decision","Decision","decision"
+  ];
+  let decCol = -1;
+  for (let i = 0; i < header.length; i++) {
+    const h = header[i].toLowerCase();
+    if (candidates.map(c => c.toLowerCase()).includes(h)) { decCol = i; break; }
+  }
+  if (decCol === -1) {
+    for (let i = 0; i < header.length; i++) {
+      const h = header[i].toLowerCase();
+      if (h.includes("combined") && h.includes("decision")) { decCol = i; break; }
+    }
+  }
+  if (decCol === -1) throw new Error("Couldn't find a 'Combined Decision' column. Not touching Sheet3.");
+  // Build filtered output (only Include)
+  const out = [header];
+  for (let r = 1; r < data.length; r++) {
+    const val = String(data[r][decCol] ?? "").trim().toLowerCase();
+    if (val === "include") out.push(data[r]);
+  }
+  // Always write to a new sheet; do not delete or overwrite anything
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || "America/Phoenix", "yyyyMMdd_HHmmss");
+  const outName = "Sheet_Final_Filtered_" + stamp;
+  const dest = ss.insertSheet(outName);
+  dest.getRange(1, 1, out.length, out[0].length).setValues(out);
+  // Light formatting for your slide
+  dest.setFrozenRows(1);
+  const hdr = dest.getRange(1, 1, 1, out[0].length);
+  hdr.setFontWeight("bold").setBackground("#f7f7f7");
+  const all = dest.getDataRange();
+  all.setWrap(true);
+  try { all.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY); } catch (_) {}
+  try { dest.autoResizeColumns(1, out[0].length); } catch (_) {}
+  // Conditional formatting on decision column (green/yellow/red)
+  if (out.length > 1) {
+    const range = dest.getRange(2, decCol + 1, out.length - 1, 1);
+    const rules = [
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo("Include").setBackground("#d9f2d9").setBold(true).setRanges([range]).build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo("Exclude").setBackground("#ffe0e0").setBold(true).setRanges([range]).build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo("Needs-Review").setBackground("#fff4cc").setBold(true).setRanges([range]).build()
+    ];
+    dest.setConditionalFormatRules(rules);
+  }
+  SpreadsheetApp.getUi().alert("Created " + outName + " (Include rows only). Sheet3 untouched.");
+}
+// ===================== SMART SEC QUERY BUILDER =====================
+function buildSecQuery_(row, type) {
+  const cusip = String(row["CUSIP"] || "").trim();
+  let issuer = String(row["Issuer_Name"] || "").trim();
+  let parent = String(row["Issuer_Parent"] || "").trim();
+  const deal = String(row["Deal_Name"] || "").trim();
+  const words = (s, n = 2) => s ? s.split(/\s+/).slice(0, n).join(" ") : "";
+  // 🧠 Parent fallback mapping for structured issuers
+  // Ally-specific for this exact deal
+  if (/ABCLN 2024-B/i.test(deal || issuer)) {
+    issuer = "Ally Bank Auto Credit-Linked Notes Trust 2024-B";
+    parent = "Ally Bank Auto Credit-Linked Notes Trust 2024-B";
+  }
+  if (/ally/i.test(parent) || /abcln/i.test(issuer))
+    parent = "Ally Auto Receivables Trust";
+  if (/ford/i.test(parent))
+    parent = "Ford Credit Auto Owner Trust";
+  if (/toyota/i.test(parent))
+    parent = "Toyota Auto Receivables Trust";
+  if (/gm/i.test(parent))
+    parent = "GM Financial Auto Receivables Trust";
+  const qParts = [];
+  if (cusip) qParts.push(`"${cusip}"`);
+  if (deal) qParts.push(`"${words(deal, 4)}"`);
+  if (issuer) qParts.push(`"${words(issuer, 4)}"`);
+  if (parent) qParts.push(`"${words(parent, 4)}"`);
+  // Add fallback terms for asset classes
+  if (type === "ABS")
+    qParts.push(`("auto" OR "receivables" OR "trust" OR "credit-linked" OR "note")`);
+  if (type === "MBS")
+    qParts.push(`("mortgage" OR "pass-through" OR "freddie" OR "fannie")`);
+  const query = qParts.filter(Boolean).join(" OR ");
+  Logger.log("🔍 SEC fallback query: %s", query || "empty");
+  return query || `"${cusip}"`;
+}
+function test_AllyTrustFeed() {
+  const txt = proxyCompanyAtom_("Ally Auto Receivables Trust", "10-D");
+  const entries = parseAtomEntries_(txt);
+  Logger.log("Entries found: " + entries.length);
+  if (entries.length > 0) {
+    Logger.log("First entry title: " + entries[0].title);
+    Logger.log("First entry link: " + entries[0].link);
+  } else {
+    Logger.log("No entries found for Ally Auto Receivables Trust (10-D)");
+  }
+}
+function lane2_stubPopulate_() {
+  // Stub for Lane 2 if needed, but now populated in lane2_populateEthics_
+  Logger.log("Lane 2 stub: Use lane2_populateEthics_ instead.");
+}
